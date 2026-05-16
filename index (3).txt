@@ -1,0 +1,237 @@
+﻿lace-place / group-22 
+* PROBLEM
+* SYSTEM
+* VISION
+* GRASP
+* PLANNING
+* DEMOS
+* CODE
+EECS / ME 106A  ·  SPRING 2026  ·  GROUP 22
+Lace &
+Place.
+A full-stack robotic shoe-sorting system: GroundingDINO + SAM for zero-shot detection, class-specific point-cloud filtering for grasp estimation, and MoveIt + ROS 2 to drive a UR7e arm from pile to rack - with a human-in-the-loop web UI at every step. 
+UR7e ROS 2 Humble MoveIt 2 GroundingDINO Segment Anything Intel RealSense Python 3 Flask 
+Anthony Kuang
+Computer Science
+Austin Strohmeier
+Mechanical Engineering
+Karanjot Singh
+Mechanical Engineering
+Ziyuan Xu
+Computer Science
+shoe_pile.png - scene input 
+
+👟
+shoe_pile.png 
+01 - MOTIVATION
+Why shoe sorting?
+Autonomous manipulation of deformable, asymmetric objects in unstructured environments is a canonical open problem in robotics. Shoes are a compelling real-world instance: they come in diverse shapes, materials, and orientations, pile unpredictably, and represent a meaningful assistive need - particularly for individuals with limited mobility who struggle with floor-level tasks like organizing footwear. 
+The Core Challenge
+Shoes are deformable, texturally complex, and class-dependent in their geometry. A rigid-body assumption fails immediately: a sneaker's heel collar behaves differently than a flat slipper sole. Any grasp strategy must reason about shoe category before committing to a contact point. Additionally, overlapping shoes in a pile create significant depth occlusion - naive centroid-based grasping produces collisions or drops. 
+Our Approach
+We built a class-conditioned perception and planning pipeline: a vision stack that detects and classifies shoes before any physical interaction, a human-in-the-loop approval gate to handle edge cases, and category-specific point-cloud filters that select grasp points based on the mechanical properties of each shoe type. The arm then executes a deterministic 7-step pick-and-place sequence. 
+02 - ARCHITECTURE
+System Design
+The pipeline runs as a set of ROS 2 nodes launched from a single bringup file. An Intel RealSense D-series camera provides synchronized RGB + aligned depth at 640×480 @ 30 Hz. The perception node handles all CV; the planning node handles all motion. A Flask web server bridges them with a human confirmation step. 
+STEP 01
+🔍
+Detection & Segmentation
+GroundingDINO produces bounding boxes. SAM produces per-pixel masks. Class scores are computed via softmax over per-token logits for each shoe category.
+STEP 02
+✅
+Human-in-the-Loop Approval
+Segments are served to a web UI at localhost:5000. The operator approves, rejects, or re-labels each detection before any motion is planned.
+STEP 03
+☁️
+Point Cloud Filtering & Grasp Estimation
+Each approved mask is unprojected into 3-D using camera intrinsics. A class-specific filter isolates the optimal grasp region; median gives the target point.
+STEP 04
+🤖
+IK + MoveIt Execution
+MoveIt's /compute_ik resolves each 6-DOF pose. RRTConnect plans collision-free paths. The UR7e executes via FollowJointTrajectory.
+RealSense → GroundingDINO → SAM → Web UI → Unproject → Filter → IK → MoveIt → UR7e 
+ROS 2 NODE & TOPIC MAP
+PERCEPTION
+shoe_pointcloud_extractor
+pkg: perception
+PLANNING
+multi_grasp
+pkg: planning
+PLANNING
+ik_planner
+pkg: planning
+MOTION
+tuck_high
+pkg: tuck_high
+CAMERA
+realsense2_camera
+640×480 @ 30 Hz
+WEB UI
+Flask server
+localhost:5000
+SUB /camera/camera/color/image_raw Image 
+SUB /camera/camera/aligned_depth_to_color/image_raw Image 
+PUB /shoe_goal_pose_{i} PoseStamped 
+PUB /shoe_heel_point_{i} PointStamped 
+PUB /shoe_points_{i}_top / _bot PointCloud2 
+PUB /filtered_points PointCloud2 
+03 - COMPUTER VISION
+Vision Pipeline & Segmentation
+Each synchronized RGB frame is passed through a two-stage detection and segmentation stack. The pipeline runs on GPU when available and falls back to CPU, making it portable across the lab's compute setup. 
+Stage 1 - GroundingDINO
+We use IDEA-Research/grounding-dino-tiny with a free-text prompt "sneaker . flip flop . slipper ." - the period-separated format the model expects for grounded detection. Detections below box_threshold=0.15 or text_threshold=0.15 are discarded. The post-processor returns axis-aligned bounding boxes in pixel coordinates. 
+Critically, we re-extract the raw per-query logits from the model output and match each post-NMS box back to its query by nearest-neighbor in normalized cx-cy-w-h space. This gives us a full logit vector per box - not just the top-1 label - which we use to compute a proper softmax class probability distribution over all three categories. 
+Stage 2 - SAM
+Each bounding box is passed to facebook/sam-vit-base as a prompt. SAM returns three mask candidates per box. We select the best candidate by argmax over the model's internal IoU quality scores - this is more reliable than area heuristics for overlapping shoes. 
+Masks are then filtered by coverage: any detection occupying less than 5% or more than 20% of the image is discarded as either noise or an impossible full-frame detection, keeping results focused on individual shoe instances. 
+cv/pipeline.py - class score extraction from raw logits Python 
+def _class_scores_from_logits(self, logits, classes, text_prompt):
+    # Tokenize the full prompt to locate each class's token span
+    tokenizer = self.gdino_proc.tokenizer
+    full_ids = tokenizer(text_prompt, add_special_tokens=True)["input_ids"]
+
+    raw_scores = []
+    for cls in classes:
+        cls_ids = tokenizer(cls, add_special_tokens=False)["input_ids"]
+        span_start = None
+        for i in range(len(full_ids) - len(cls_ids) + 1):
+            if full_ids[i : i + len(cls_ids)] == cls_ids:
+                span_start = i; break
+        # Max logit over the class's token span
+        score = logits[span_start : span_start + len(cls_ids)].max().item()
+        raw_scores.append(score)
+
+    # Softmax gives a proper probability distribution
+    probs = torch.softmax(torch.tensor(raw_scores), dim=0)
+    return {cls: float(probs[i]) for i, cls in enumerate(classes)}
+Web UI - Segment Approval
+Before any point cloud is built or trajectory planned, all detected segments are served to a Flask web server at localhost:5000. The operator sees the detection overlay and per-segment cards showing the cropped shoe thumbnail, confidence score, and the full class probability bar chart. Each segment can be toggled, re-labeled via a dropdown, or rejected. Only confirmed segments proceed. 
+This human-in-the-loop gate prevents mislabeled or partially occluded detections from reaching the physical arm - a critical safety layer in an unstructured environment. 
+localhost:5000 - approval UI 
+
+Human operator reviews and confirms detections before motion
+04 - GRASP POINT ESTIMATION
+Class-Conditioned Point Cloud Filtering
+The approved 2D mask is back-projected into 3D using the camera's intrinsic parameters (fx, fy, cx, cy from /camera/camera/color/camera_info) and the aligned depth image. The resulting per-shoe point cloud is then processed by a filter whose logic is conditioned on the detected shoe class. All resulting points are transformed into the robot's base_link frame via a TF2 lookup before being published. 
+perception/process_pointcloud.py - depth unproject Python 
+def _unproject(self, depth_m, fx, fy, cx, cy):
+    # Convert aligned depth image (H, W) in metres to (H, W, 3) XYZ in camera frame
+    H, W = depth_m.shape
+    uu, vv = np.meshgrid(np.arange(W, dtype=np.float32),
+                          np.arange(H, dtype=np.float32))
+    X = (uu - cx) * depth_m / fx
+    Y = (vv - cy) * depth_m / fy
+    return np.stack([X, Y, depth_m], axis=-1)  # (H, W, 3)
+
+# Apply mask, remove NaN depth pixels, transform to base_link
+pts = cloud_xyz[mask]
+pts = pts[np.isfinite(pts).all(axis=1)]
+pts_base = (rot @ pts.T).T + tvec  # rot, tvec from TF2 lookup
+SNEAKER
+Heel-Directed Longitudinal Split
+Sneakers present the most challenging geometry: a rigid heel counter, a soft flexible upper, and significant height variation along the long axis. Grasping near the toe risks material collapse under the gripper load; center-mass grasps produce unstable picks. 
+Method: The shoe's long axis is determined from the 2D mask's direction_uv vector. The top-sliced point cloud is projected onto this axis and split at the centroid. The half with shallower mean camera depth is the toe. The opposite half (heel) is selected - the heel collar provides the rigid material needed for a secure pick. Within the heel half, points beyond the 90th percentile of longitudinal projection are isolated and a final top-8mm slice taken. The median is published as /shoe_heel_point_{i}. 
+Global top-8mm slice (Z_SLICE_M = 0.0008 m) applied first to eliminate floor noise
+Long axis from direction_uv in segment metadata, projected into base_link
+Heel sub-cloud: points with |projection| ≥ 90th percentile of absolute projection
+Final grasp: median of top-8mm slice of heel sub-cloud → PointStamped in base_link
+SLIPPER & FLIP-FLOP
+Top-Slab Median Grasping
+Slippers and flip-flops are relatively flat with a well-defined, consistent top surface. The longitudinal split used for sneakers is counterproductive here - slippers have no rigid heel and flip-flops are nearly uniform along their length. 
+Method: After unprojecting the masked pixels to 3D, we find the minimum camera-frame Z across all valid points (the shallowest surface). We keep only points within Z_SLICE_M = 0.0008 m (0.8 mm) of that minimum - isolating the topmost surface slab. The 3D median of this slab is published as /shoe_goal_pose_{i}. 
+No shape assumptions - works across soft foam slippers and flat flip-flops without per-shape tuning
+Robust to orientation ambiguity - no axis-fitting required
+Same code path handles both classes; label from the web UI approval step determines routing
+ALL CLASSES
+Gripper Orientation from 2D Mask
+Grasp point estimation alone is insufficient - the gripper must approach with the correct wrist rotation. We extract a direction_uv vector from each segment (the dominant axis of the 2D mask bounding rectangle). This image-space vector is projected into base_link via the camera-to-base rotation matrix, then passed through arctan2 to yield a gripper yaw angle. This is composed with a straight-down quaternion [qx=0, qy=1, qz=0, qw=0] using scipy's Rotation class and published as the orientation component of /shoe_goal_pose_{i}. 
+05 - MOTION PLANNING & EXECUTION
+IK, MoveIt, & Trajectory Execution
+Once grasp poses are published, the planning node subscribes to the appropriate topics (heel point for sneakers, full pose for slippers/flip-flops), resolves inverse kinematics, plans collision-free paths, and executes a structured pick-and-place sequence for each approved shoe in user-specified order. 
+Inverse Kinematics
+The IKPlanner node calls MoveIt's /compute_ik service with avoid_collisions=True, a 5-second timeout, group ur_manipulator, and tip link wrist_3_link. The default down-facing quaternion (qy=1) encodes a gripper pointing straight down - appropriate for top-surface grasping. 
+Motion Planning
+The /plan_kinematic_path service runs RRTConnectkConfigDefault with 15 seconds of planning time. Joint goal constraints are set with ±0.01 rad tolerance. Failed plans are logged and that shoe is skipped - the robot continues to the next in the queue rather than halting entirely. 
+Trajectory Execution
+Joint trajectories are sent to the /scaled_joint_trajectory_controller/follow_joint_trajectory action server. The "tuck high" intermediate pose is executed as a subprocess call to ros2 run ur7e_utils tuck with a 1-second settle delay between consecutive trajectories. 
+EXECUTION SEQUENCE - PER APPROVED SHOE ↺ repeats for each shoe in --order 
+01
+Tuck High
+02
+Pre-Grasp
+z + 0.185 m
+03
+Grasp
+z + 0.140 m
+04
+Close
+Gripper
+05
+Retract
+z + 0.800 m
+06
+Drop-Off
+Position
+07
+Open
+Gripper
+IK is pre-computed for all three arm positions (pre-grasp, grasp, retract) before execution begins. If any IK call fails, that shoe is skipped entirely and the robot proceeds to the next. Drop-off is a hardcoded joint configuration: [4.49, -1.47, -1.41, -1.69, 0.59, -3.18] rad. The gripper is actuated via the /toggle_gripper service (Trigger). 
+planning/main.py - job queue builder (abridged) Python 
+for idx in self.pick_order:
+    x, y, z, qx, qy, qz, qw = self.grab_points[idx]
+
+    # Tuck to safe overhead pose before each pick
+    job_queue.append('tuck')
+
+    # Pre-grasp: 18.5 cm above target
+    pre_grasp = ik_planner.compute_ik(joint_state, x, y, z + 0.185, qx, qy, qz, qw)
+    job_queue.append(pre_grasp)
+
+    # Grasp: 14 cm above target (contact depth)
+    grasp = ik_planner.compute_ik(joint_state, x, y, z + 0.140, qx, qy, qz, qw)
+    job_queue.append(grasp)
+
+    job_queue.append('toggle_grip')   # close
+
+    # Retract high before swinging to drop-off
+    retract = ik_planner.compute_ik(joint_state, x, y, z + 0.800, qx, qy, qz, qw)
+    job_queue.append(retract)
+
+    job_queue.append(drop_off_joint_state)   # hardcoded rack position
+    job_queue.append('toggle_grip')         # open
+Tuck High - Overhead Observation Pose
+The tuck_high node moves the arm to a fixed overhead configuration before each pick: [4.716, -1.592, -0.979, -2.124, 1.576, -3.137] rad. This clears the workspace of the arm from the shoe pile, prevents collisions during approach, and ensures the camera has a clean, repeatable field of view if the pipeline were extended to re-capture between picks. Planning uses the same RRTConnect planner with a 5-second budget. 
+06 - RESULTS
+Demo Videos
+Live recordings of the UR7e running the full pipeline in the Berkeley robotics lab. 
+ur7e_demo_01.mp4 
+Full end-to-end run: messy pile in, organized rack out.
+ur7e_demo_02.mp4 
+Close-up: sneaker grasp using the longitudinal-split heel filter.
+ur7e_demo_03.mp4 
+Slipper and flip-flop: top-slab median filter in action.
+ur7e_demo_04.mp4 
+🌐
+Web UI segment approval walkthrough
+[recording coming soon] 
+Operator reviews segment cards, re-labels, confirms - then motion begins.
+07 - REFLECTION
+Challenges & Future Work
+The system demonstrates robust end-to-end operation for common shoe types under controlled lighting, with clear identified failure modes guiding future work. 
+What hurt
+* Sneaker toe sag mid-lift: the flexible upper deforms as the arm raises, shifting the shoe's center of mass and reducing rack-placement accuracy. A stiffer grasp strategy or re-grip after lift could address this.
+* GroundingDINO performance degrades under harsh or inconsistent lab lighting, occasionally mislabeling shoe types. This blocks the class-conditioned filter from running correctly and requires human re-labeling via the web UI.
+* The rack position is hardcoded as a fixed joint configuration rather than mapped as a collision object in the MoveIt planning scene, requiring wide safety margins that limit placement precision.
+* Single-frame perception: the pipeline processes one synchronized frame and does not re-observe the scene between picks, so displacement from earlier grasps is not accounted for.
+What's next
+* Pair-matching and semantic ordering: track left/right pairs using the mask geometry and place matched pairs together on the rack without requiring the --order flag.
+* Map the rack into the MoveIt planning scene using Octomap or a known rigid-body model, enabling tighter, more precise placement trajectories with real collision awareness.
+* Semantic slot selection: assess free space on the rack and choose an appropriate slot rather than always placing at a fixed hardcoded position.
+* Re-perception between picks: after each successful place, re-run the CV pipeline to update positions of remaining shoes that may have shifted due to contact.
+Open Source
+Full ROS 2 source, CV pipeline, and Flask approval UI available on GitHub.
+↗ github.com/shimamooo/106a-final-project 
+$ ros2 run ur7e_utils enable_comms 
+$ ros2 launch planning lab5_bringup.launch.py 
+$ ros2 run planning main --order 0 1 2 
+Lace & Place Robotics  ·  UC Berkeley EECS / ME 106A  ·  Spring 2026  ·  Group 22   |   Kuang · Strohmeier · Singh · Xu 
